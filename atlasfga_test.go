@@ -198,3 +198,111 @@ func TestMissingStore(t *testing.T) {
 		t.Fatal("expected a no-store error")
 	}
 }
+
+func TestConditionContextConsistencyRoundTrip(t *testing.T) {
+	var got map[string]interface{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &got)
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/write") {
+			_, _ = w.Write([]byte(`{"object":"fga.write_result","writes":1,"deletes":0,"consistency_token":"tok1"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"object":"fga.check","allowed":true,"consistency_token":"tok2"}`))
+	}))
+	t.Cleanup(srv.Close)
+	c := New("sk_test", WithBaseURL(srv.URL), WithStore("s"))
+	ctx := context.Background()
+
+	cond := &Condition{Name: "in_window", Context: map[string]interface{}{"start": "a"}}
+	w, err := c.WriteTuples(ctx, TupleKey{User: "user:a", Relation: "viewer", Object: "doc:1", Condition: cond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wc := got["writes"].([]interface{})[0].(map[string]interface{})["condition"].(map[string]interface{})
+	if wc["name"] != "in_window" || w.ConsistencyToken != "tok1" {
+		t.Fatalf("unexpected write: %v / %+v", got, w)
+	}
+	// A tuple without a condition must not send the key at all.
+	if b, _ := json.Marshal(TupleKey{User: "u", Relation: "r", Object: "o"}); strings.Contains(string(b), "condition") {
+		t.Fatalf("condition leaked: %s", b)
+	}
+
+	res, err := c.Check(ctx, CheckParams{User: "user:a", Relation: "viewer", Object: "doc:1",
+		Context: map[string]interface{}{"now": "t"}, Consistency: ConsistencyHigherConsistency, ConsistencyToken: w.ConsistencyToken})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got["consistency"] != "HIGHER_CONSISTENCY" || got["consistency_token"] != "tok1" || got["context"].(map[string]interface{})["now"] != "t" {
+		t.Fatalf("unexpected check body: %v", got)
+	}
+	if res.ConsistencyToken != "tok2" {
+		t.Fatalf("unexpected check result: %+v", res)
+	}
+}
+
+func TestListAllUsersFollowsPages(t *testing.T) {
+	var tokens []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/list-users") {
+			t.Errorf("unexpected path %s", r.URL.Path)
+		}
+		var p ListUsersParams
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &p)
+		tokens = append(tokens, p.ContinuationToken)
+		w.Header().Set("Content-Type", "application/json")
+		if p.ContinuationToken == "" {
+			_, _ = w.Write([]byte(`{"object":"fga.list_users","users":["user:a","user:*"],"excluded_users":["user:x"],"continuation_token":"next","consistency_token":"c"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"object":"fga.list_users","users":["user:b"],"excluded_users":["user:x"],"continuation_token":null,"consistency_token":"c2"}`))
+	}))
+	t.Cleanup(srv.Close)
+	c := New("sk_test", WithBaseURL(srv.URL), WithStore("s"))
+	res, err := c.ListAllUsers(context.Background(), ListUsersParams{
+		Object: "doc:1", Relation: "viewer", UserFilters: []UserFilter{{Type: "user"}}, PageSize: 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(res.Users, ",") != "user:a,user:*,user:b" || len(res.ExcludedUsers) != 1 || res.ContinuationToken != nil || res.ConsistencyToken != "c2" {
+		t.Fatalf("unexpected merged result: %+v", res)
+	}
+	if len(tokens) != 2 || tokens[1] != "next" {
+		t.Fatalf("expected a second call with the token, got %v", tokens)
+	}
+}
+
+func TestEachChangeFollowsPages(t *testing.T) {
+	var uris []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		uris = append(uris, r.Method+" "+r.URL.RequestURI())
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Query().Get("continuation_token") == "" {
+			_, _ = w.Write([]byte(`{"object":"list","data":[{"object":"fga.tuple_change","operation":"write","user":"user:a","relation":"viewer","target":"doc:1","consistency_token":"t","created_at":5}],"has_more":true,"continuation_token":"c1"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"object":"fga.tuple_change","operation":"delete","user":"user:a","relation":"viewer","target":"doc:1","condition":{"name":"n"},"consistency_token":"t2","created_at":6}],"has_more":false,"continuation_token":"c2"}`))
+	}))
+	t.Cleanup(srv.Close)
+	c := New("sk_test", WithBaseURL(srv.URL), WithStore("s"))
+	var ops []string
+	var lastCond *Condition
+	cursor, err := c.EachChange(context.Background(), ReadChangesParams{Type: "doc", PageSize: 1, StartTime: "2026-01-01T00:00:00Z"}, func(ch TupleChange) error {
+		ops = append(ops, ch.Operation)
+		lastCond = ch.Condition
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(ops, ",") != "write,delete" || cursor != "c2" || lastCond == nil || lastCond.Name != "n" {
+		t.Fatalf("unexpected walk: ops=%v cursor=%q cond=%+v", ops, cursor, lastCond)
+	}
+	if uris[0] != "GET /v1/fga/stores/s/changes?page_size=1&start_time=2026-01-01T00%3A00%3A00Z&type=doc" ||
+		!strings.Contains(uris[1], "continuation_token=c1") {
+		t.Fatalf("unexpected requests: %v", uris)
+	}
+}

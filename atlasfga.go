@@ -26,6 +26,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 )
 
@@ -82,11 +83,38 @@ func New(secretKey string, opts ...Option) *Client {
 
 /* ---- wire types -------------------------------------------------------- */
 
+// Condition attaches a named model condition to a tuple; Context holds the
+// values bound to the condition's parameters at write time (optional).
+type Condition struct {
+	Name    string                 `json:"name"`
+	Context map[string]interface{} `json:"context,omitempty"`
+}
+
+// ConditionDefinition is one entry of an authorization model's top-level
+// conditions map (for AuthorizationModelInput.Conditions). Parameters maps a
+// parameter name to its type, e.g. {"type_name": "TYPE_NAME_STRING"}.
+type ConditionDefinition struct {
+	Name       string                            `json:"name,omitempty"`
+	Expression string                            `json:"expression"`
+	Parameters map[string]map[string]interface{} `json:"parameters,omitempty"`
+}
+
+// Read-consistency modes for the Consistency request field. MinimizeLatency
+// (the default) may be served from a short-lived cache; HigherConsistency
+// bypasses it.
+const (
+	ConsistencyUnspecified       = "UNSPECIFIED"
+	ConsistencyMinimizeLatency   = "MINIMIZE_LATENCY"
+	ConsistencyHigherConsistency = "HIGHER_CONSISTENCY"
+)
+
 // TupleKey is a relationship tuple. Object is the target as "type:id".
+// Condition is optional.
 type TupleKey struct {
-	User     string `json:"user"`
-	Relation string `json:"relation"`
-	Object   string `json:"object"`
+	User      string     `json:"user"`
+	Relation  string     `json:"relation"`
+	Object    string     `json:"object"`
+	Condition *Condition `json:"condition,omitempty"`
 }
 
 // Tuple is a stored relationship tuple as returned by Read.
@@ -96,6 +124,8 @@ type Tuple struct {
 	Relation  string `json:"relation"`
 	Target    string `json:"target"`
 	CreatedAt int64  `json:"created_at"`
+	// Condition is set only when the tuple has one.
+	Condition *Condition `json:"condition,omitempty"`
 }
 
 // Store is an FGA store.
@@ -138,6 +168,12 @@ type CheckParams struct {
 	Object               string     `json:"object"`
 	AuthorizationModelID string     `json:"authorization_model_id,omitempty"`
 	ContextualTuples     []TupleKey `json:"contextual_tuples,omitempty"`
+	// Context supplies request-time values for condition parameters.
+	Context map[string]interface{} `json:"context,omitempty"`
+	// Consistency is one of the Consistency* constants; ConsistencyToken (from
+	// a prior write) guarantees the read reflects at least that write.
+	Consistency      string `json:"consistency,omitempty"`
+	ConsistencyToken string `json:"consistency_token,omitempty"`
 }
 
 // CheckResult is a single check verdict.
@@ -145,6 +181,7 @@ type CheckResult struct {
 	Object               string `json:"object"`
 	Allowed              bool   `json:"allowed"`
 	AuthorizationModelID string `json:"authorization_model_id"`
+	ConsistencyToken     string `json:"consistency_token,omitempty"`
 }
 
 // WriteParams writes and/or deletes tuples in one atomic call.
@@ -158,6 +195,8 @@ type WriteResult struct {
 	Object  string `json:"object"`
 	Writes  int    `json:"writes"`
 	Deletes int    `json:"deletes"`
+	// ConsistencyToken: pass it as ConsistencyToken on a later read to see this write.
+	ConsistencyToken string `json:"consistency_token,omitempty"`
 }
 
 // ReadParams queries stored tuples by any of user / relation / object.
@@ -169,11 +208,14 @@ type ReadParams struct {
 
 // ListObjectsParams lists the objects of a type a user has a relation to.
 type ListObjectsParams struct {
-	User                 string     `json:"user"`
-	Relation             string     `json:"relation"`
-	Type                 string     `json:"type"`
-	AuthorizationModelID string     `json:"authorization_model_id,omitempty"`
-	ContextualTuples     []TupleKey `json:"contextual_tuples,omitempty"`
+	User                 string                 `json:"user"`
+	Relation             string                 `json:"relation"`
+	Type                 string                 `json:"type"`
+	AuthorizationModelID string                 `json:"authorization_model_id,omitempty"`
+	ContextualTuples     []TupleKey             `json:"contextual_tuples,omitempty"`
+	Context              map[string]interface{} `json:"context,omitempty"`
+	Consistency          string                 `json:"consistency,omitempty"`
+	ConsistencyToken     string                 `json:"consistency_token,omitempty"`
 }
 
 // ListObjectsResult is the list-objects verdict (objects as "type:id").
@@ -181,6 +223,70 @@ type ListObjectsResult struct {
 	Object               string   `json:"object"`
 	Objects              []string `json:"objects"`
 	AuthorizationModelID string   `json:"authorization_model_id"`
+	ConsistencyToken     string   `json:"consistency_token,omitempty"`
+}
+
+// UserFilter selects the kind of users to list: a Type, optionally narrowed to
+// usersets of Relation (returned as "type:id#relation").
+type UserFilter struct {
+	Type     string `json:"type"`
+	Relation string `json:"relation,omitempty"`
+}
+
+// ListUsersParams lists the users with a relation to an object. UserFilters
+// must hold exactly one filter. PageSize is 1-1000 (default 1000).
+type ListUsersParams struct {
+	Object               string                 `json:"object"`
+	Relation             string                 `json:"relation"`
+	UserFilters          []UserFilter           `json:"user_filters"`
+	AuthorizationModelID string                 `json:"authorization_model_id,omitempty"`
+	ContextualTuples     []TupleKey             `json:"contextual_tuples,omitempty"`
+	Context              map[string]interface{} `json:"context,omitempty"`
+	Consistency          string                 `json:"consistency,omitempty"`
+	ConsistencyToken     string                 `json:"consistency_token,omitempty"`
+	PageSize             int                    `json:"page_size,omitempty"`
+	ContinuationToken    string                 `json:"continuation_token,omitempty"`
+}
+
+// ListUsersResult holds users as "type:id", usersets as "type:id#relation", or
+// the wildcard "type:*". ExcludedUsers are ids a wildcard does not cover.
+type ListUsersResult struct {
+	Object               string   `json:"object"`
+	Users                []string `json:"users"`
+	ExcludedUsers        []string `json:"excluded_users"`
+	ContinuationToken    *string  `json:"continuation_token"`
+	AuthorizationModelID string   `json:"authorization_model_id"`
+	ConsistencyToken     string   `json:"consistency_token,omitempty"`
+}
+
+// ReadChangesParams pages through the tuple changes feed. PageSize is 1-100
+// (default 50); StartTime is RFC 3339.
+type ReadChangesParams struct {
+	Type              string
+	PageSize          int
+	ContinuationToken string
+	StartTime         string
+}
+
+// TupleChange is one entry of the changes feed; Operation is "write" or "delete".
+type TupleChange struct {
+	Object           string     `json:"object"`
+	Operation        string     `json:"operation"`
+	User             string     `json:"user"`
+	Relation         string     `json:"relation"`
+	Target           string     `json:"target"`
+	Condition        *Condition `json:"condition,omitempty"`
+	ConsistencyToken string     `json:"consistency_token"`
+	CreatedAt        int64      `json:"created_at"` // epoch ms
+}
+
+// ChangesPage is a page of the changes feed. ContinuationToken is returned even
+// on the last page; pass it later to receive only newer changes.
+type ChangesPage struct {
+	Object            string        `json:"object"`
+	Data              []TupleChange `json:"data"`
+	HasMore           bool          `json:"has_more"`
+	ContinuationToken string        `json:"continuation_token"`
 }
 
 // ExpandParams expands the full userset tree for an object#relation.
@@ -204,18 +310,23 @@ type BatchCheckItem struct {
 	Object           string     `json:"object"`
 	CorrelationID    string     `json:"correlation_id,omitempty"`
 	ContextualTuples []TupleKey `json:"contextual_tuples,omitempty"`
+	// Context supplies this item's request-time condition values.
+	Context map[string]interface{} `json:"context,omitempty"`
 }
 
 // BatchCheckParams is the body of a batch check (<=100 items).
 type BatchCheckParams struct {
 	Checks               []BatchCheckItem `json:"checks"`
 	AuthorizationModelID string           `json:"authorization_model_id,omitempty"`
+	Consistency          string           `json:"consistency,omitempty"`
+	ConsistencyToken     string           `json:"consistency_token,omitempty"`
 }
 
 // BatchCheckResult is the batch-check verdict set.
 type BatchCheckResult struct {
 	Object               string `json:"object"`
 	AuthorizationModelID string `json:"authorization_model_id"`
+	ConsistencyToken     string `json:"consistency_token,omitempty"`
 	Result               []struct {
 		CorrelationID string `json:"correlation_id"`
 		Allowed       bool   `json:"allowed"`
@@ -385,6 +496,112 @@ func (c *Client) ListObjectsIn(ctx context.Context, storeID string, params ListO
 	return out, c.do(ctx, http.MethodPost, "/v1/fga/stores/"+url.PathEscape(id)+"/list-objects", params, out)
 }
 
+// ListUsers lists the users with a relation to an object (one page).
+func (c *Client) ListUsers(ctx context.Context, params ListUsersParams) (*ListUsersResult, error) {
+	return c.ListUsersIn(ctx, "", params)
+}
+
+// ListUsersIn lists users against storeID (or the default).
+func (c *Client) ListUsersIn(ctx context.Context, storeID string, params ListUsersParams) (*ListUsersResult, error) {
+	id, err := c.storeOr(storeID)
+	if err != nil {
+		return nil, err
+	}
+	params.AuthorizationModelID = c.withModel(params.AuthorizationModelID)
+	out := &ListUsersResult{}
+	return out, c.do(ctx, http.MethodPost, "/v1/fga/stores/"+url.PathEscape(id)+"/list-users", params, out)
+}
+
+// ListAllUsers follows ContinuationToken and merges every page.
+func (c *Client) ListAllUsers(ctx context.Context, params ListUsersParams) (*ListUsersResult, error) {
+	return c.ListAllUsersIn(ctx, "", params)
+}
+
+// ListAllUsersIn is ListAllUsers against storeID (or the default).
+func (c *Client) ListAllUsersIn(ctx context.Context, storeID string, params ListUsersParams) (*ListUsersResult, error) {
+	params.ContinuationToken = ""
+	merged, err := c.ListUsersIn(ctx, storeID, params)
+	if err != nil {
+		return nil, err
+	}
+	seen := map[string]bool{}
+	for _, u := range merged.ExcludedUsers {
+		seen[u] = true
+	}
+	for merged.ContinuationToken != nil && *merged.ContinuationToken != "" {
+		params.ContinuationToken = *merged.ContinuationToken
+		page, err := c.ListUsersIn(ctx, storeID, params)
+		if err != nil {
+			return nil, err
+		}
+		merged.Users = append(merged.Users, page.Users...)
+		for _, u := range page.ExcludedUsers {
+			if !seen[u] {
+				seen[u] = true
+				merged.ExcludedUsers = append(merged.ExcludedUsers, u)
+			}
+		}
+		if page.ConsistencyToken != "" {
+			merged.ConsistencyToken = page.ConsistencyToken
+		}
+		merged.ContinuationToken = page.ContinuationToken
+	}
+	return merged, nil
+}
+
+// ReadChanges reads one page of the tuple changes feed.
+func (c *Client) ReadChanges(ctx context.Context, params ReadChangesParams) (*ChangesPage, error) {
+	return c.ReadChangesIn(ctx, "", params)
+}
+
+// ReadChangesIn reads the changes feed of storeID (or the default).
+func (c *Client) ReadChangesIn(ctx context.Context, storeID string, params ReadChangesParams) (*ChangesPage, error) {
+	id, err := c.storeOr(storeID)
+	if err != nil {
+		return nil, err
+	}
+	q := url.Values{}
+	if params.Type != "" {
+		q.Set("type", params.Type)
+	}
+	if params.PageSize > 0 {
+		q.Set("page_size", strconv.Itoa(params.PageSize))
+	}
+	if params.ContinuationToken != "" {
+		q.Set("continuation_token", params.ContinuationToken)
+	}
+	if params.StartTime != "" {
+		q.Set("start_time", params.StartTime)
+	}
+	path := "/v1/fga/stores/" + url.PathEscape(id) + "/changes"
+	if len(q) > 0 {
+		path += "?" + q.Encode()
+	}
+	out := &ChangesPage{}
+	return out, c.do(ctx, http.MethodGet, path, nil, out)
+}
+
+// EachChange calls fn for every change, following pages until HasMore is false.
+// It returns the final ContinuationToken (the cursor for next time). fn
+// returning an error stops the walk and returns that error.
+func (c *Client) EachChange(ctx context.Context, params ReadChangesParams, fn func(TupleChange) error) (string, error) {
+	for {
+		page, err := c.ReadChanges(ctx, params)
+		if err != nil {
+			return "", err
+		}
+		for _, ch := range page.Data {
+			if err := fn(ch); err != nil {
+				return "", err
+			}
+		}
+		if !page.HasMore {
+			return page.ContinuationToken, nil
+		}
+		params.ContinuationToken = page.ContinuationToken
+	}
+}
+
 // Read queries stored tuples against the default store.
 func (c *Client) Read(ctx context.Context, params ReadParams) (*ListPage[Tuple], error) {
 	return c.ReadIn(ctx, "", params)
@@ -509,6 +726,15 @@ func (b *BoundStore) Write(ctx context.Context, p WriteParams) (*WriteResult, er
 }
 func (b *BoundStore) ListObjects(ctx context.Context, p ListObjectsParams) (*ListObjectsResult, error) {
 	return b.c.ListObjectsIn(ctx, b.storeID, p)
+}
+func (b *BoundStore) ListUsers(ctx context.Context, p ListUsersParams) (*ListUsersResult, error) {
+	return b.c.ListUsersIn(ctx, b.storeID, p)
+}
+func (b *BoundStore) ListAllUsers(ctx context.Context, p ListUsersParams) (*ListUsersResult, error) {
+	return b.c.ListAllUsersIn(ctx, b.storeID, p)
+}
+func (b *BoundStore) ReadChanges(ctx context.Context, p ReadChangesParams) (*ChangesPage, error) {
+	return b.c.ReadChangesIn(ctx, b.storeID, p)
 }
 func (b *BoundStore) Read(ctx context.Context, p ReadParams) (*ListPage[Tuple], error) {
 	return b.c.ReadIn(ctx, b.storeID, p)
